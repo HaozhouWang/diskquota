@@ -38,6 +38,13 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "libpq-fe.h"
+
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+#include "cdb/cdbvars.h"
+#include "utils/int8.h"
+
 
 #include "activetable.h"
 #include "diskquota.h"
@@ -131,6 +138,7 @@ static void update_role_map(Oid owneroid, int64 updatesize);
 static void remove_namespace_map(Oid namespaceoid);
 static void remove_role_map(Oid owneroid);
 static bool load_quotas(void);
+static HTAB* pull_table_stats_from_seg(bool force);
 
 static Size DiskQuotaShmemSize(void);
 static void disk_quota_shmem_startup(void);
@@ -562,7 +570,7 @@ calculate_table_disk_usage(bool force)
 	classRel = heap_open(RelationRelationId, AccessShareLock);
 	relScan = heap_beginscan_catalog(classRel, 0, NULL);
 
-	local_active_table_stat_map = get_active_tables();
+	local_active_table_stat_map = pull_table_stats_from_seg(force);
 
 	/* unset is_exist flag for tsentry in table_size_map*/
 	hash_seq_init(&iter, table_size_map);
@@ -895,5 +903,80 @@ quota_check_common(Oid reloid)
 	}
 	LWLockRelease(black_map_shm_lock->lock);
 	return true;
+}
+
+static HTAB*
+pull_table_stats_from_seg(bool force)
+{
+	CdbPgResults cdb_pgresults = {NULL, 0};
+	int i, j;
+	char *sql;
+	HTAB *local_table_stats_map = NULL;
+	HASHCTL ctl;
+
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(DiskQuotaSegmentTableKey);
+	ctl.entrysize = sizeof(DiskQuotaActiveTableEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	ctl.hash = tag_hash;
+
+	local_table_stats_map = hash_create("local active table map with relfilenode info",
+	                                    1024,
+	                                    &ctl,
+	                                    HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
+
+	if (force)
+	{
+		sql = "select * from diskquota.diskquota_fetch_active_table_stat(true)";
+	}
+	else
+	{
+		sql = "select * from diskquota.diskquota_fetch_active_table_stat(false)";
+	}
+
+	CdbDispatchCommand(sql, DF_NONE, &cdb_pgresults);
+
+	/* collect data from each segment */
+	for (i = 0; i < cdb_pgresults.numResults; i++) {
+
+		Size tableSize;
+		int32 sdbid;
+		Oid tableOid;
+		DiskQuotaSegmentTableKey key;
+		DiskQuotaSegmentTableEntry *entry;
+
+		struct pg_result *pgresult = cdb_pgresults.pg_results[i];
+
+		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK) {
+			cdbdisp_clearCdbPgResults(&cdb_pgresults);
+			ereport(ERROR,
+			        (errmsg("unexpected result from segment: %d",
+			                PQresultStatus(pgresult))));
+		}
+
+		for (j = 0; j < PQntuples(pgresult); j++)
+		{
+			tableOid = DatumGetObjectId(CStringGetDatum(PQgetvalue(pgresult, j, 0)));
+			sdbid = DatumGetInt32(CStringGetDatum(PQgetvalue(pgresult, j, 1)));
+			tableSize = (Size) DatumGetInt64(CStringGetDatum(PQgetvalue(pgresult, j, 2)));
+
+			key.tableoid = tableOid;
+			key.segmentid = sdbid;
+
+			entry = (DiskQuotaSegmentTableEntry *) hash_search(local_table_stats_map, &key, HASH_ENTER, NULL);
+			entry->tableoid = tableOid;
+			entry->segmentid = sdbid;
+			entry->tablesize = tableSize;
+
+		}
+
+	}
+
+	cdbdisp_clearCdbPgResults(&cdb_pgresults);
+
+	return local_table_stats_map;
+
 }
 

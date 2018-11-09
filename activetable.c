@@ -24,6 +24,7 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "cdb/cdbvars.h"
 
 #include "activetable.h"
 #include "diskquota.h"
@@ -263,4 +264,59 @@ report_active_table_SmgrStat(SMgrRelation reln)
 		/* We may miss the file size change of this relation at current refresh interval.*/
 		ereport(WARNING, (errmsg("Share memory is not enough for active tables.")));
 	}
+}
+
+HTAB*
+get_all_tables_size(void)
+{
+	HTAB *local_table_stats_map = NULL;
+	HASHCTL ctl;
+	HeapTuple tuple;
+	Relation classRel;
+	HeapScanDesc relScan;
+
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(DiskQuotaActiveTableEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	ctl.hash = oid_hash;
+
+	local_table_stats_map = hash_create("local active table map with relfilenode info",
+	                                    1024,
+	                                    &ctl,
+	                                    HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
+
+
+	classRel = heap_open(RelationRelationId, AccessShareLock);
+	relScan = heap_beginscan_catalog(classRel, 0, NULL);
+
+
+	while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
+	{
+		Oid relOid;
+		DiskQuotaActiveTableEntry *entry;
+
+		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+		if (classForm->relkind != RELKIND_RELATION &&
+		    classForm->relkind != RELKIND_MATVIEW)
+			continue;
+		relOid = HeapTupleGetOid(tuple);
+
+		/* ignore system table*/
+		if (relOid < FirstNormalObjectId)
+			continue;
+
+		entry = (DiskQuotaActiveTableEntry *) hash_search(local_table_stats_map, &relOid, HASH_ENTER, NULL);
+
+		entry->tableoid = relOid;
+		entry->tablesize = (Size) DatumGetInt64(DirectFunctionCall1(pg_total_relation_size,
+		                                                     ObjectIdGetDatum(relOid)));
+
+	}
+
+	heap_endscan(relScan);
+	heap_close(classRel, AccessShareLock);
+
+	return local_table_stats_map;
 }
