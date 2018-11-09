@@ -43,8 +43,10 @@
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbvars.h"
+#include "cdb/cdbutil.h"
 #include "utils/int8.h"
 
+#include <stdlib.h>
 
 #include "activetable.h"
 #include "diskquota.h"
@@ -63,10 +65,15 @@ typedef struct QuotaLimitEntry QuotaLimitEntry;
 typedef struct BlackMapEntry BlackMapEntry;
 typedef struct LocalBlackMapEntry LocalBlackMapEntry;
 
-/* local cache of table disk size and corresponding schema and owner */
+/*
+ * local cache of table disk size and corresponding schema and owner
+ * For GPDB:
+ * reloid + segmentid are the key of the hash table
+ */
 struct TableSizeEntry
 {
 	Oid			reloid;
+	int32       segmentid;
 	Oid			namespaceoid;
 	Oid			owneroid;
 	int64		totalsize;
@@ -233,13 +240,13 @@ init_disk_quota_model(void)
 
 	/* init hash table for table/schema/role etc.*/
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.keysize = sizeof(DiskQuotaSegmentTableKey);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
 	hash_ctl.hcxt = CurrentMemoryContext;
-	hash_ctl.hash = oid_hash;
+	hash_ctl.hash = tag_hash;
 
 	table_size_map = hash_create("TableSizeEntry map",
-								1024,
+								1024 * 8,
 								&hash_ctl,
 								HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 
@@ -557,15 +564,16 @@ static void
 calculate_table_disk_usage(bool force)
 {
 	bool found;
-	bool active_tbl_found;
+	bool active_tbl_found = false;
 	Relation	classRel;
 	HeapTuple	tuple;
 	HeapScanDesc relScan;
-	TableSizeEntry *tsentry;
+	TableSizeEntry *tsentry = NULL;
 	Oid			relOid;
 	HASH_SEQ_STATUS iter;
 	HTAB *local_active_table_stat_map;
-	DiskQuotaActiveTableEntry *active_table_entry;
+	DiskQuotaSegmentTableEntry *active_table_entry;
+	int i;
 
 	classRel = heap_open(RelationRelationId, AccessShareLock);
 	relScan = heap_beginscan_catalog(classRel, 0, NULL);
@@ -588,6 +596,11 @@ calculate_table_disk_usage(bool force)
 	{
 		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
 		found = false;
+
+		bool nsmoved = false;
+		bool rolemoved = false;
+		int j;
+
 		if (classForm->relkind != RELKIND_RELATION &&
 			classForm->relkind != RELKIND_MATVIEW)
 			continue;
@@ -597,65 +610,112 @@ calculate_table_disk_usage(bool force)
 		if(relOid < FirstNormalObjectId)
 			continue;
 
-		tsentry = (TableSizeEntry *)hash_search(table_size_map,
-							 &relOid,
-							 HASH_ENTER, &found);
-		/* mark tsentry is_exist */
-		if (tsentry)
+		for(i = 2; i <= getgpsegmentCount() + 1; i++)
+		{
+			DiskQuotaSegmentTableKey key;
+			key.tableoid = relOid;
+			key.segmentid = i;
+
+
+			tsentry = (TableSizeEntry *)hash_search(table_size_map,
+			                                        &key,
+			                                        HASH_ENTER, &found);
+			/* mark tsentry is_exist */
 			tsentry->is_exist = true;
 
-		active_table_entry = (DiskQuotaActiveTableEntry *) hash_search(local_active_table_stat_map, &relOid, HASH_FIND, &active_tbl_found);
+			active_table_entry = (DiskQuotaSegmentTableEntry *) hash_search(local_active_table_stat_map,
+				                                                             &key, HASH_FIND, &active_tbl_found);
 
-		/* skip to recalculate the tables which are not in active list and not at initializatio stage*/
-		if(active_tbl_found || force)
-		{
+			if (active_tbl_found)
+			{
+				if (!found)
+				{
+					tsentry->reloid = relOid;
+					tsentry->namespaceoid = classForm->relnamespace;
+					tsentry->owneroid = classForm->relowner;
+					tsentry->totalsize = active_table_entry->tablesize;
+					tsentry->segmentid = active_table_entry->segmentid;
+					update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
+					update_role_map(tsentry->owneroid, tsentry->totalsize);
+				}
+				else {
+					/* check if it has changed */
 
-			/* namespace and owner may be changed since last check*/
-			if (!found)
-			{
-				/* if it's a new table*/
-				tsentry->reloid = relOid;
-				tsentry->namespaceoid = classForm->relnamespace;
-				tsentry->owneroid = classForm->relowner;
-				if (!force)
-				{
-					tsentry->totalsize = (int64) active_table_entry->tablesize;
-				}
-				else
-				{
-					tsentry->totalsize =  DatumGetInt64(DirectFunctionCall1(pg_total_relation_size,
-														ObjectIdGetDatum(relOid)));
-				}
-				update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
-				update_role_map(tsentry->owneroid, tsentry->totalsize);
-			}
-			else
-			{
-				/* if not new table in table_size_map, it must be in active table list */
-				if (active_tbl_found)
-				{
+					if (tsentry->namespaceoid != classForm->relnamespace)
+					{
+						nsmoved = true;
+					}
+
+					if (tsentry->owneroid != classForm->relowner)
+					{
+						rolemoved = true;
+					}
+
+					if (nsmoved)
+					{
+						DiskQuotaSegmentTableKey tempkey;
+						TableSizeEntry *tempentry;
+						for (j = 2; j < getgpsegmentCount(); j++)
+						{
+							bool tempfound = false;
+
+							tempkey.tableoid = relOid;
+							tempkey.segmentid = j;
+
+							tempentry = (TableSizeEntry *) hash_search(table_size_map,
+											                        &tempkey,
+											                        HASH_FIND,
+											                        &tempfound);
+
+
+							update_namespace_map(tempentry->namespaceoid, -1 * tempentry->totalsize);
+							tempentry->namespaceoid = classForm->relnamespace;
+							update_namespace_map(tempentry->namespaceoid, tempentry->totalsize);
+
+
+						}
+						nsmoved = false;
+					}
+
+					if (rolemoved)
+					{
+						DiskQuotaSegmentTableKey tempkey;
+						TableSizeEntry *tempentry;
+						for (j = 2; j < getgpsegmentCount(); j++)
+						{
+							bool tempfound = false;
+
+							tempkey.tableoid = relOid;
+							tempkey.segmentid = j;
+
+							tempentry = (TableSizeEntry *) hash_search(table_size_map,
+							                                           &tempkey,
+							                                           HASH_FIND,
+							                                           &tempfound);
+
+
+							update_role_map(tempentry->owneroid, -1 * tempentry->totalsize);
+							tempentry->owneroid = classForm->relowner;
+							update_role_map(tempentry->owneroid, tempentry->totalsize);
+
+						}
+						rolemoved = false;
+
+					}
+
+					/* if not new table in table_size_map, it must be in active table list */
 					int64 oldtotalsize = tsentry->totalsize;
 					tsentry->totalsize = (int64) active_table_entry->tablesize;
 					update_namespace_map(tsentry->namespaceoid, tsentry->totalsize - oldtotalsize);
 					update_role_map(tsentry->owneroid, tsentry->totalsize - oldtotalsize);
+
 				}
 			}
+
 		}
 
-		/* if schema change, transfer the file size */
-		if (tsentry->namespaceoid != classForm->relnamespace)
-		{
-			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
-			tsentry->namespaceoid = classForm->relnamespace;
-			update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
-		}
-		/* if owner change, transfer the file size */
-		if(tsentry->owneroid != classForm->relowner)
-		{
-			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
-			tsentry->owneroid = classForm->relowner;
-			update_role_map(tsentry->owneroid, tsentry->totalsize);
-		}
+		/* skip to recalculate the tables which are not in active list and not at initializatio stage*/
+
 	}
 
 	heap_endscan(relScan);
