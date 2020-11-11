@@ -9,6 +9,7 @@ CREATE SCHEMA diskquota;
 CREATE TABLE diskquota.quota_config (targetOid oid, quotatype int, quotalimitMB int8, PRIMARY KEY(targetOid, quotatype));
 
 SELECT pg_catalog.pg_extension_config_dump('diskquota.quota_config', '');
+SELECT gp_segment_id, pg_catalog.pg_extension_config_dump('diskquota.quota_config', '') from gp_dist_random('gp_id');
 
 CREATE FUNCTION diskquota.set_schema_quota(text, text)
 RETURNS void STRICT
